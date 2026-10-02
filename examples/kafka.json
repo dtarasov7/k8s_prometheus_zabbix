@@ -1,0 +1,12 @@
+{
+  "url": "https://prometheus-kafka.example.org",
+  "timeout": 5,
+  "cache_ttl": 60,
+  "cache_dir": "/var/cache/kafka-prometheus",
+  "username": "zabbix",
+  "password_file": "kafka.password",
+  "selector": {
+    "job": "kafka-exporter",
+    "instance": "kafka-exporter.example.org:9308"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "url": "http://prometheus-k8s.example.org:9090",
+  "timeout": 5,
+  "cache_ttl": 60,
+  "cache_dir": "/var/cache/k8s-prometheus"
+}
