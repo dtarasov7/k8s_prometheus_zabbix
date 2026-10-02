@@ -93,7 +93,7 @@ class IntegrationTests(unittest.TestCase):
     def write_config(self, name="config.json", **overrides):
         settings = {"url": self.url, "cache_dir": str(self.directory / "cache"),
                     "cache_ttl": 60, "timeout": 2,
-                    "selector": {"job": "kafka-exporter", "instance": "exporter:9308"}}
+                    "selector": {"job": "kafka-exporter"}}
         settings.update(overrides)
         path = self.directory / name
         path.write_text(json.dumps(settings), encoding="utf-8")
@@ -120,7 +120,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_version_matches_code_without_prometheus(self):
         expected = __version__
-        self.assertEqual(expected, "1.1.0")
+        self.assertEqual(expected, "1.2.0")
         self.server.status = 503
         for script in ("kafka_prometheus.py", "k8s_prometheus.py"):
             result = self.cli("--version", script=script)
@@ -329,6 +329,43 @@ class IntegrationTests(unittest.TestCase):
     def test_empty_discovery_is_json(self):
         self.respond("kafka_topic_partitions", [])
         self.assertEqual(json.loads(self.cli("topic.discovery").stdout), {"data": []})
+
+    def test_named_label_filters_metrics_and_up_without_instance(self):
+        config = self.write_config(label_name="namespace", label_value="kafka")
+        expected_up = 'up{job="kafka-exporter",namespace="kafka"}'
+        expected_brokers = 'kafka_brokers{job="kafka-exporter",namespace="kafka"}'
+        self.server.responses[expected_up] = vector([sample(1)])
+        self.server.responses[expected_brokers] = vector([sample(3)])
+        self.assertEqual(self.cli("exporter.up", config=config).stdout, "1\n")
+        self.assertEqual(self.cli("brokers", config=config).stdout, "3\n")
+        self.assertEqual([query for query, _ in self.server.calls], [expected_up, expected_brokers])
+        self.assertNotIn("instance=", expected_up)
+        # IP пода меняется, но выбор target остаётся тем же. / Pod IP changes, selection stays stable.
+        updated = self.write_config(cache_ttl=0, label_name="namespace", label_value="kafka")
+        self.server.responses[expected_up] = vector([sample(1, instance="10.0.0.1:9308")])
+        self.assertEqual(self.cli("exporter.up", config=updated).stdout, "1\n")
+        self.server.responses[expected_up] = vector([sample(1, instance="10.0.0.2:9308")])
+        self.assertEqual(self.cli("exporter.up", config=updated).stdout, "1\n")
+        self.assertEqual([query for query, _ in self.server.calls[-2:]], [expected_up, expected_up])
+
+    def test_named_label_works_without_legacy_selector(self):
+        config = self.write_config(selector={}, label_name="namespace", label_value="kafka")
+        query = 'up{namespace="kafka"}'
+        self.server.responses[query] = vector([sample(1)])
+        self.assertEqual(self.cli("exporter.up", config=config).stdout, "1\n")
+        self.assertEqual(self.server.calls[0][0], query)
+
+    def test_named_label_validation(self):
+        invalid = (
+            {"label_name": "namespace"},
+            {"label_value": "kafka"},
+            {"label_name": "bad-label", "label_value": "kafka"},
+            {"label_name": "__name__", "label_value": "kafka"},
+            {"label_name": "job", "label_value": "kafka"},
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=overrides):
+                self.assert_failure(self.cli("brokers", config=self.write_config(cache_ttl=0, **overrides)))
 
     def test_selector_required(self):
         config = self.write_config(selector={})

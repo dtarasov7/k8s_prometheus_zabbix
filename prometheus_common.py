@@ -20,7 +20,7 @@ import urllib.request
 
 
 # Single release source / Единый источник версии выпуска.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 class MonitoringError(Exception):
@@ -189,7 +189,7 @@ def load_settings(service, path=None):
         "url": "http://127.0.0.1:9090", "timeout": 10, "cache_ttl": 60,
         "cache_dir": f"/tmp/{service}-prometheus-cache",
         "username": "", "password": "", "password_file": "", "ca_file": "",
-        "selector": {},
+        "selector": {}, "label_name": "", "label_value": "",
     }
     allowed = set(settings)
     if path:
@@ -210,7 +210,8 @@ def load_settings(service, path=None):
         env_key = "PROM_" + key.upper()
         if env_key in os.environ:
             settings[key] = os.environ[env_key]
-    for key in ("url", "cache_dir", "username", "password", "password_file", "ca_file"):
+    for key in ("url", "cache_dir", "username", "password", "password_file", "ca_file",
+                "label_name", "label_value"):
         if not isinstance(settings[key], str):
             raise MonitoringError(f"Параметр {key} должен быть строкой")
     for key in ("timeout", "cache_ttl"):
@@ -246,6 +247,16 @@ def load_settings(service, path=None):
         for key, value in selector.items()
     ):
         raise MonitoringError("selector должен содержать имена labels и строковые значения")
+    label_name, label_value = settings["label_name"], settings["label_value"]
+    if bool(label_name) != bool(label_value):
+        raise MonitoringError("label_name и label_value должны быть заданы вместе и не быть пустыми")
+    if label_name:
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", label_name) or label_name == "__name__":
+            raise MonitoringError("label_name должен быть допустимым именем label Prometheus")
+        if label_name in selector:
+            raise MonitoringError("label_name уже указан в selector; оставьте его в одном месте")
+        # Сохраняем прежний selector и добавляем выбранный label. / Merge the chosen label with legacy selectors.
+        settings["selector"] = {**selector, label_name: label_value}
     return settings
 
 

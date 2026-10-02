@@ -1,6 +1,6 @@
 # Метрики Kubernetes и Kafka из Prometheus для Zabbix
 
-Текущая версия: **1.1.0**. Предыдущая версия Kubernetes-скрипта считается
+Текущая версия: **1.2.0**. Предыдущие выпуски: **v1.1.0** и
 **v1.0.0**. Изменения описаны в [CHANGELOG.md](CHANGELOG.md).
 Версия хранится в переменной `__version__` модуля `prometheus_common.py` и выводится
 командой `--version` обоих скриптов.
@@ -102,9 +102,10 @@ sudo install -d -o zabbix -g zabbix -m 0700 /var/cache/kafka-prometheus
   "username": "zabbix",
   "password_file": "kafka.password",
   "selector": {
-    "job": "kafka-exporter",
-    "instance": "kafka-exporter.example.org:9308"
-  }
+    "job": "kafka-exporter"
+  },
+  "label_name": "namespace",
+  "label_value": "kafka"
 }
 ```
 
@@ -171,26 +172,36 @@ HTTP-перенаправления не выполняются, чтобы не
 Если всё хранится в одном Prometheus, задайте одинаковый `url` в обоих файлах.
 Если источники разные — задайте разные адреса и при необходимости разные пароли.
 
-В одном Kafka-конфиге `selector` должен выбирать **один exporter одного Kafka-кластера**.
-Предпочтительно использовать target labels `job` и `instance`, которые есть и у
-Kafka-метрик, и у `up`. Произвольный label, добавленный только внутри exporter,
-может отсутствовать у `up`; тогда `exporter.up` не найдёт серию.
-
-Selector — объект точных соответствий, не регулярных выражений:
+В одном Kafka-конфиге фильтр должен выбирать **один exporter одного Kafka-кластера**.
+`instance` в Kubernetes может содержать IP пода и меняться после рестарта,
+поэтому в примере используется пара `label_name`/`label_value` для стабильного
+label. Имя label задаётся в `label_name`, точное значение — в `label_value`:
 
 ```json
-"selector": {
-  "job": "kafka-exporter",
-  "instance": "exporter-a:9308",
-  "cluster": "production"
+{
+  "selector": {"job": "kafka-exporter"},
+  "label_name": "namespace",
+  "label_value": "kafka"
 }
 ```
 
-Все условия применяются одновременно. В этом примере label `cluster` должен
-присутствовать в нужных сериях. Пустой selector запрещён для Kafka-команд, кроме
-`prometheus.health`. Для Kubernetes selector не поддерживается: его запросы
-сохраняют существующую область выбора. Если K8s-источник содержит несколько
-кластеров, агрегаты могут объединять их, как и в исходном скрипте.
+Эти поля добавляют условие `namespace="kafka"` к `selector` в каждом запросе,
+включая `up`. Выберите label, который реально присутствует **и у Kafka-метрик,
+и у `up`**. `namespace` здесь лишь пример: проверьте labels своего target в
+Prometheus. Один только `namespace` может содержать несколько exporter;
+комбинация с `job` или другим стабильным label должна выбирать один target.
+
+`selector` по-прежнему принимает другие точные условия. Например, можно оставить
+в нём `job` и добавить `cluster`, если оба labels присутствуют у нужных серий.
+`label_name` и `label_value` задаются вместе, должны быть непустыми; повторять
+`label_name` в `selector` нельзя. `instance` в старом `selector` технически
+продолжает работать, но после изменения IP пода его придётся обновлять.
+
+Пустой итоговый фильтр запрещён для Kafka-команд, кроме `prometheus.health`.
+Для Kubernetes фильтр не поддерживается: его запросы сохраняют существующую
+область выбора. Если K8s-источник содержит несколько кластеров, агрегаты могут
+объединять их, как и в исходном скрипте. Глобальные `PROM_LABEL_NAME` и
+`PROM_LABEL_VALUE` для K8s-конфига задавать не следует.
 
 Скрипт Kafka отвергает повторяющиеся серии с одинаковыми предметными labels.
 Например, две серии lag с одинаковыми `consumergroup`, `topic`, `partition`
@@ -218,7 +229,9 @@ selector нужно проверить по реальным labels.
 | `password_file` | `PROM_PASSWORD_FILE` | Не задан |
 | `password` | Нет | Не задан |
 | `ca_file` | `PROM_CA_FILE` | Системное хранилище CA |
-| `selector` | Нет | `{}`; требуется для Kafka-метрик |
+| `selector` | Нет | `{}`; дополнительные точные условия Kafka |
+| `label_name` | `PROM_LABEL_NAME` | Пустая строка; имя стабильного label Kafka |
+| `label_value` | `PROM_LABEL_VALUE` | Пустая строка; значение этого label |
 | Выбор файла | `PROM_CONFIG` | Не задан |
 
 `PROM_PASSWORD` не используется. Неизвестные поля JSON приводят к ошибке, чтобы
@@ -238,7 +251,7 @@ PROM_URL=http://prometheus-k8s.example.org:9090 python3 k8s_prometheus.py cluste
 
 ## Версия
 
-Оба скрипта используют `__version__ = "1.1.0"` из `prometheus_common.py`.
+Оба скрипта используют `__version__ = "1.2.0"` из `prometheus_common.py`.
 Отдельного файла версии нет. После установки проверьте:
 
 ```bash
@@ -246,7 +259,7 @@ python3 kafka_prometheus.py --version
 python3 k8s_prometheus.py --version
 ```
 
-Обе команды должны вывести `1.1.0` и завершиться с кодом `0`. Они не обращаются
+Обе команды должны вывести `1.2.0` и завершиться с кодом `0`. Они не обращаются
 к Prometheus и не требуют файла конфигурации. Порядок выпусков и изменения API перечислены в
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -311,7 +324,7 @@ python3 kafka_prometheus.py --config /etc/zabbix/prometheus/kafka.json group_top
 К имени каждой метрики добавляется selector, например:
 
 ```promql
-kafka_consumergroup_lag{instance="kafka-exporter.example.org:9308",job="kafka-exporter"}
+kafka_consumergroup_lag{job="kafka-exporter",namespace="kafka"}
 ```
 
 Весь набор серий сохраняется в кэш. Выбор группы/топика и агрегация выполняются
@@ -618,13 +631,13 @@ PYCODE
 Команда запрашивает встроенную метрику Prometheus `up` с selector из Kafka-конфига:
 
 ```promql
-up{instance="kafka-exporter.example.org:9308",job="kafka-exporter"}
+up{job="kafka-exporter",namespace="kafka"}
 ```
 
 Теперь сообщение об отсутствии серии содержит этот запрос и подсказку проверить
 labels у `up`. Если ответ HTTP содержит `"result": []`, Prometheus выполнил запрос,
-но подходящих серий нет. Сравните `job`, `instance` и другие условия selector
-с labels реально существующей серии `up` в Prometheus. Labels самих Kafka-метрик
+но подходящих серий нет. Сравните `job`, `label_name`/`label_value` и другие
+условия selector с labels реально существующей серии `up` в Prometheus. Labels самих Kafka-метрик
 и labels `up` могут отличаться; особенно это касается labels внутри exporter.
 
 Если видите `cache_hit` с пустым результатом, повторите запуск с `PROM_CACHE_TTL=0`,
