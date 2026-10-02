@@ -120,7 +120,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_version_matches_code_without_prometheus(self):
         expected = __version__
-        self.assertEqual(expected, "1.2.0")
+        self.assertEqual(expected, "1.3.1")
         self.server.status = 503
         for script in ("kafka_prometheus.py", "k8s_prometheus.py"):
             result = self.cli("--version", script=script)
@@ -330,8 +330,8 @@ class IntegrationTests(unittest.TestCase):
         self.respond("kafka_topic_partitions", [])
         self.assertEqual(json.loads(self.cli("topic.discovery").stdout), {"data": []})
 
-    def test_named_label_filters_metrics_and_up_without_instance(self):
-        config = self.write_config(label_name="namespace", label_value="kafka")
+    def test_selector_filters_metrics_and_up_without_instance(self):
+        config = self.write_config(selector={"job": "kafka-exporter", "namespace": "kafka"})
         expected_up = 'up{job="kafka-exporter",namespace="kafka"}'
         expected_brokers = 'kafka_brokers{job="kafka-exporter",namespace="kafka"}'
         self.server.responses[expected_up] = vector([sample(1)])
@@ -341,31 +341,32 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([query for query, _ in self.server.calls], [expected_up, expected_brokers])
         self.assertNotIn("instance=", expected_up)
         # IP пода меняется, но выбор target остаётся тем же. / Pod IP changes, selection stays stable.
-        updated = self.write_config(cache_ttl=0, label_name="namespace", label_value="kafka")
+        updated = self.write_config(cache_ttl=0, selector={"job": "kafka-exporter", "namespace": "kafka"})
         self.server.responses[expected_up] = vector([sample(1, instance="10.0.0.1:9308")])
         self.assertEqual(self.cli("exporter.up", config=updated).stdout, "1\n")
         self.server.responses[expected_up] = vector([sample(1, instance="10.0.0.2:9308")])
         self.assertEqual(self.cli("exporter.up", config=updated).stdout, "1\n")
         self.assertEqual([query for query, _ in self.server.calls[-2:]], [expected_up, expected_up])
 
-    def test_named_label_works_without_legacy_selector(self):
-        config = self.write_config(selector={}, label_name="namespace", label_value="kafka")
+    def test_selector_accepts_any_label_without_job(self):
+        config = self.write_config(selector={"namespace": "kafka"})
         query = 'up{namespace="kafka"}'
         self.server.responses[query] = vector([sample(1)])
         self.assertEqual(self.cli("exporter.up", config=config).stdout, "1\n")
         self.assertEqual(self.server.calls[0][0], query)
 
-    def test_named_label_validation(self):
-        invalid = (
-            {"label_name": "namespace"},
-            {"label_value": "kafka"},
-            {"label_name": "bad-label", "label_value": "kafka"},
-            {"label_name": "__name__", "label_value": "kafka"},
-            {"label_name": "job", "label_value": "kafka"},
-        )
-        for overrides in invalid:
-            with self.subTest(overrides=overrides):
-                self.assert_failure(self.cli("brokers", config=self.write_config(cache_ttl=0, **overrides)))
+    def test_selector_accepts_multiple_stable_labels(self):
+        selector = {"namespace": "kafka", "service": "exporter", "cluster": "production"}
+        config = self.write_config(selector=selector)
+        query = 'up{cluster="production",namespace="kafka",service="exporter"}'
+        self.server.responses[query] = vector([sample(1)])
+        self.assertEqual(self.cli("exporter.up", config=config).stdout, "1\n")
+        self.assertEqual(self.server.calls[0][0], query)
+
+    def test_removed_label_name_fields_are_rejected(self):
+        for field in ("label_name", "label_value"):
+            with self.subTest(field=field):
+                self.assert_failure(self.cli("brokers", config=self.write_config(**{field: "old"})))
 
     def test_selector_required(self):
         config = self.write_config(selector={})
@@ -400,6 +401,54 @@ class IntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {"PROM_TIMEOUT": "3", "PROM_CACHE_TTL": "0", "PROM_URL": "http://other:9090"}):
             settings = load_settings("kafka", str(self.config))
         self.assertEqual((settings["timeout"], settings["cache_ttl"], settings["url"]), (3, 0, "http://other:9090"))
+
+    def test_k8s_selector_filters_every_metric_family(self):
+        config = self.write_config(selector={"cluster": "production"}, cache_ttl=0)
+        expected = (
+            (("node.discovery",), 'kube_node_info{cluster="production"}'),
+            (("node.condition", "Ready", "worker-01"),
+             'kube_node_status_condition{cluster="production",condition="Ready",node="worker-01",status="true"}'),
+            (("cluster", "oomkilled"),
+             'sum(kube_pod_container_status_last_terminated_reason{cluster="production",reason="OOMKilled"})'),
+            (("cluster", "crashloop"),
+             'sum(kube_pod_container_status_waiting_reason{cluster="production",reason="CrashLoopBackOff"})'),
+            (("cluster", "pending"), 'sum(kube_pod_status_phase{cluster="production",phase="Pending"})'),
+            (("cluster", "failed"), 'sum(kube_pod_status_phase{cluster="production",phase="Failed"})'),
+            (("cluster", "deployment_not_ready"),
+             'sum(clamp_min(kube_deployment_spec_replicas{cluster="production"} - '
+             'kube_deployment_status_ready_replicas{cluster="production"}, 0))'),
+            (("cluster", "pvc_not_bound"),
+             'sum(kube_persistentvolumeclaim_status_phase{cluster="production",phase!="Bound"})'),
+            (("ingress.service_status.discovery",),
+             'sum by (service, status) (increase(nginx_ingress_controller_request{cluster="production"}[1m]))'),
+            (("ingress.status.service", "500", "app"),
+             'sum by (service, status) (increase(nginx_ingress_controller_request{cluster="production"}[1m]))'),
+        )
+        for args, query in expected:
+            with self.subTest(args=args):
+                result = self.cli(*args, script="k8s_prometheus.py", config=config)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.server.calls[-1][0], query)
+        self.assertEqual(len(self.server.calls), len(expected))
+
+    def test_k8s_selector_same_label_and_conflict(self):
+        config = self.write_config(selector={"phase": "Pending"}, cache_ttl=0)
+        result = self.cli("cluster", "pending", script="k8s_prometheus.py", config=config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server.calls[-1][0], 'sum(kube_pod_status_phase{phase="Pending"})')
+        result = self.cli("cluster", "failed", script="k8s_prometheus.py", config=config)
+        self.assert_failure(result, "phase")
+        config = self.write_config(selector={"phase": "Bound"}, cache_ttl=0)
+        self.assert_failure(self.cli("cluster", "pvc_not_bound", script="k8s_prometheus.py", config=config), "phase")
+        config = self.write_config(selector={"node": "worker-02"}, cache_ttl=0)
+        self.assert_failure(self.cli("node.condition", "Ready", "worker-01", script="k8s_prometheus.py", config=config), "node")
+        self.assertEqual(len(self.server.calls), 1)
+
+    def test_k8s_selector_does_not_affect_prometheus_health(self):
+        config = self.write_config(selector={"cluster": "production"})
+        result = self.cli("prometheus.health", script="k8s_prometheus.py", config=config)
+        self.assertEqual((result.returncode, result.stdout), (0, "1\n"), result.stderr)
+        self.assertEqual(self.server.calls[-1][0], "vector(1)")
 
     def test_k8s_legacy_commands_and_empty_value(self):
         config = self.write_config(selector={}, cache_ttl=0)

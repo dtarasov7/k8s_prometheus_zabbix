@@ -1,42 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Единый скрипт для zabbix-agent / glabber.
-
-Назначение:
-  - получать метрики из Prometheus;
-  - отдавать значения в формате, понятном zabbix-agent / glabber;
-  - делать LLD discovery для нод и ingress service/status;
-  - кэшировать запросы к Prometheus (кроме prometheus.health).
-
-Важно:
-  zabbix-agent запускает UserParameter каждый раз как отдельный процесс.
-  Поэтому кэш хранится не в памяти, а в файлах на диске.
-
-"""
-
-"""
-   Конфиг агента:
-
-UserParameter=k8s.node.discovery,/etc/zabbix/scripts/k8s_prometheus.py node.discovery
-UserParameter=k8s.node.condition[*],/etc/zabbix/scripts/k8s_prometheus.py node.condition "$1" "$2"
-
-UserParameter=k8s.cluster.metric[*],/etc/zabbix/scripts/k8s_prometheus.py cluster "$1"
-
-UserParameter=k8s.ingress.service_status.discovery,/etc/zabbix/scripts/k8s_prometheus.py ingress.service_status.discovery
-UserParameter=k8s.ingress.status.service[*],/etc/zabbix/scripts/k8s_prometheus.py ingress.status.service "$1" "$2"
-
-Для `/var/cache` лучше так:
-
-mkdir -p /var/cache/k8s-prometheus
-chown zabbix:zabbix /var/cache/k8s-prometheus
-
-и в systemd/env или в скрипте указать:
-
-PROM_CACHE_DIR=/var/cache/k8s-prometheus
-"""
-
+"""Метрики Kubernetes из Prometheus для Zabbix. / Kubernetes metrics for Zabbix."""
 
 import json
 import sys
@@ -49,32 +14,14 @@ from prometheus_common import (
 _client = None
 
 
+# Простые агрегаты: метрика и обязательные labels. / Simple aggregates: metric and required labels.
 CLUSTER_QUERIES = {
-    "oomkilled": (
-        'sum(kube_pod_container_status_last_terminated_reason{reason="OOMKilled"})'
-    ),
-    "crashloop": (
-        'sum(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"})'
-    ),
-    "pending": (
-        'sum(kube_pod_status_phase{phase="Pending"})'
-    ),
-    "failed": (
-        'sum(kube_pod_status_phase{phase="Failed"})'
-    ),
-    "deployment_not_ready": (
-        "sum("
-        "  clamp_min("
-        "    kube_deployment_spec_replicas"
-        "    -"
-        "    kube_deployment_status_ready_replicas,"
-        "    0"
-        "  )"
-        ")"
-    ),
-    "pvc_not_bound": (
-        'sum(kube_persistentvolumeclaim_status_phase{phase!="Bound"})'
-    ),
+    "oomkilled": ("kube_pod_container_status_last_terminated_reason", {"reason": "OOMKilled"}),
+    "crashloop": ("kube_pod_container_status_waiting_reason", {"reason": "CrashLoopBackOff"}),
+    "pending": ("kube_pod_status_phase", {"phase": "Pending"}),
+    "failed": ("kube_pod_status_phase", {"phase": "Failed"}),
+    "deployment_not_ready": None,
+    "pvc_not_bound": None,
 }
 
 
@@ -84,6 +31,39 @@ NODE_CONDITIONS = {
     "DiskPressure": "DiskPressure",
     "PIDPressure": "PIDPressure",
 }
+
+
+def k8s_metric(metric, equals=None, not_equals=None):
+    """Добавляет K8s selector к исходной метрике. / Applies the K8s selector to a source metric.
+
+    Args / Аргументы:
+        metric (str): имя метрики / metric name
+        equals (dict[str, str] | None): обязательные labels / required labels
+        not_equals (dict[str, str] | None): исключаемые labels / excluded labels
+
+    Returns / Возвращает:
+        str: PromQL selector метрики / metric selector
+
+    Raises / Исключения:
+        MonitoringError: конфликт labels / conflicting labels
+    """
+    global _client
+    if _client is None:
+        _client = PrometheusClient("k8s")
+    return _client.metric_query(metric, equals=equals, not_equals=not_equals)
+
+
+def ingress_query():
+    """Строит общий запрос для ingress discovery и значений. / Builds the shared ingress query.
+
+    Returns / Возвращает:
+        str: агрегат по service/status / service/status aggregate
+
+    Raises / Исключения:
+        MonitoringError: конфликт labels / conflicting labels
+    """
+    metric_selector = k8s_metric("nginx_ingress_controller_request")
+    return f"sum by (service, status) (increase({metric_selector}[1m]))"
 
 
 def prometheus_query(query):
@@ -121,7 +101,8 @@ def get_single_value(query):
         return 0.0
     if len(result) != 1:
         raise MonitoringError("Ожидалась одна серия Kubernetes; уточните источник")
-    return number(result[0]["value"][1])
+    raw_value = result[0]["value"][1]
+    return number(raw_value)
 
 
 def node_discovery():
@@ -133,19 +114,22 @@ def node_discovery():
     Raises / Исключения:
         MonitoringError: ошибка запроса / query error
     """
-    result = prometheus_query("kube_node_info")
+    query = k8s_metric("kube_node_info")
+    result = prometheus_query(query)
 
     nodes = []
     seen = set()
 
     for item in result:
-        node = item.get("metric", {}).get("node")
+        labels = item.get("metric", {})
+        node = labels.get("node")
 
         if node and node not in seen:
             seen.add(node)
             nodes.append({"{#NODE}": node})
 
-    print(json.dumps({"data": nodes}, ensure_ascii=False))
+    discovery = {"data": nodes}
+    print(json.dumps(discovery, ensure_ascii=False))
 
 
 def ingress_service_status_discovery():
@@ -157,11 +141,7 @@ def ingress_service_status_discovery():
     Raises / Исключения:
         MonitoringError: ошибка запроса / query error
     """
-    query = """
-        sum by (service, status) (
-          increase(nginx_ingress_controller_request[1m])
-        )
-    """
+    query = ingress_query()
 
     result = prometheus_query(query)
 
@@ -188,7 +168,8 @@ def ingress_service_status_discovery():
             "{#STATUS}": status,
         })
 
-    print(json.dumps({"data": items}, ensure_ascii=False))
+    discovery = {"data": items}
+    print(json.dumps(discovery, ensure_ascii=False))
 
 
 def cluster_metric(name):
@@ -203,8 +184,20 @@ def cluster_metric(name):
     Raises / Исключения:
         MonitoringError: ошибка запроса или значения / query or value error
     """
-    query = CLUSTER_QUERIES[name]
-    print_value(get_single_value(query))
+    if name == "deployment_not_ready":
+        specified = k8s_metric("kube_deployment_spec_replicas")
+        ready = k8s_metric("kube_deployment_status_ready_replicas")
+        query = f"sum(clamp_min({specified} - {ready}, 0))"
+    elif name == "pvc_not_bound":
+        excluded_labels = {"phase": "Bound"}
+        pvc = k8s_metric("kube_persistentvolumeclaim_status_phase", not_equals=excluded_labels)
+        query = f"sum({pvc})"
+    else:
+        metric, labels = CLUSTER_QUERIES[name]
+        metric_selector = k8s_metric(metric, equals=labels)
+        query = f"sum({metric_selector})"
+    value = get_single_value(query)
+    print_value(value)
 
 
 def node_condition(condition, node):
@@ -220,13 +213,11 @@ def node_condition(condition, node):
     Raises / Исключения:
         MonitoringError: ошибка запроса или значения / query or value error
     """
-    # Экранируем имя ноды как PromQL-строку. / Escape the node as a PromQL string.
-    query = (
-        'kube_node_status_condition'
-        f'{{node={json.dumps(node)},condition={json.dumps(condition)},status="true"}}'
-    )
-
-    print_value(get_single_value(query))
+    # Имя ноды экранируется в общем builder. / The shared builder escapes the node label.
+    required_labels = {"node": node, "condition": condition, "status": "true"}
+    query = k8s_metric("kube_node_status_condition", equals=required_labels)
+    value = get_single_value(query)
+    print_value(value)
 
 
 def ingress_status_service(status, service):
@@ -242,11 +233,7 @@ def ingress_status_service(status, service):
     Raises / Исключения:
         MonitoringError: ошибка запроса или значения / query or value error
     """
-    query = """
-        sum by (service, status) (
-          increase(nginx_ingress_controller_request[1m])
-        )
-    """
+    query = ingress_query()
 
     result = prometheus_query(query)
 
@@ -339,15 +326,15 @@ def main():
             usage()
             sys.exit(1)
 
-        _client = PrometheusClient("k8s", config_path, debug=DebugLog(debug_path))
-        if _client.selector:
-            raise MonitoringError("selector поддерживается только kafka_prometheus.py")
+        debug_log = DebugLog(debug_path)
+        _client = PrometheusClient("k8s", config_path, debug=debug_log)
         command = sys.argv[1]
 
         if command == "prometheus.health":
             if len(sys.argv) != 2:
                 raise MonitoringError("prometheus.health не принимает аргументов")
-            print_value(_client.health())
+            health_value = _client.health()
+            print_value(health_value)
             return
 
         if command == "node.discovery":

@@ -1,7 +1,7 @@
 # Метрики Kubernetes и Kafka из Prometheus для Zabbix
 
-Текущая версия: **1.2.0**. Предыдущие выпуски: **v1.1.0** и
-**v1.0.0**. Изменения описаны в [CHANGELOG.md](CHANGELOG.md).
+Текущая версия: **1.3.1**. Предыдущие выпуски: **v1.3.0**, **v1.2.0**,
+**v1.1.0** и **v1.0.0**. Изменения описаны в [CHANGELOG.md](CHANGELOG.md).
 Версия хранится в переменной `__version__` модуля `prometheus_common.py` и выводится
 командой `--version` обоих скриптов.
 
@@ -89,6 +89,35 @@ sudo install -d -o zabbix -g zabbix -m 0700 /var/cache/kafka-prometheus
 }
 ```
 
+### Kubernetes: фильтр по labels
+
+В Kubernetes-конфиг можно добавить `selector`, чтобы получать метрики только
+одного кластера или другого нужного набора серий:
+
+```json
+{
+  "url": "http://prometheus-k8s.example.org:9090",
+  "cache_dir": "/var/cache/k8s-prometheus",
+  "selector": {"cluster": "production"}
+}
+```
+
+`cluster` здесь пример. Выберите label, который реально есть у нужных
+`kube_*`-метрик **и у ingress-метрики**, если используете ingress-команды.
+Фильтр добавляется к исходной метрике до `sum`, вычитания реплик и расчёта
+`increase`. Например, `cluster pending` выполнит:
+
+```promql
+sum(kube_pod_status_phase{cluster="production",phase="Pending"})
+```
+
+Пустой `selector` для Kubernetes разрешён и сохраняет прежние запросы.
+`prometheus.health` всегда проверяет только API через `vector(1)` и не зависит
+от `selector`. Если обязательное условие команды противоречит `selector`,
+например `phase="Running"` для `cluster pending`, команда завершится ошибкой.
+Отсутствующая серия в прежних числовых K8s-проверках по-прежнему даёт `0`,
+поэтому перед включением триггеров проверьте наличие выбранных серий.
+
 ### Kafka с логином и паролем
 
 `/etc/zabbix/prometheus/kafka.json`:
@@ -102,10 +131,9 @@ sudo install -d -o zabbix -g zabbix -m 0700 /var/cache/kafka-prometheus
   "username": "zabbix",
   "password_file": "kafka.password",
   "selector": {
-    "job": "kafka-exporter"
-  },
-  "label_name": "namespace",
-  "label_value": "kafka"
+    "job": "kafka-exporter",
+    "namespace": "kafka"
+  }
 }
 ```
 
@@ -172,36 +200,32 @@ HTTP-перенаправления не выполняются, чтобы не
 Если всё хранится в одном Prometheus, задайте одинаковый `url` в обоих файлах.
 Если источники разные — задайте разные адреса и при необходимости разные пароли.
 
-В одном Kafka-конфиге фильтр должен выбирать **один exporter одного Kafka-кластера**.
-`instance` в Kubernetes может содержать IP пода и меняться после рестарта,
-поэтому в примере используется пара `label_name`/`label_value` для стабильного
-label. Имя label задаётся в `label_name`, точное значение — в `label_value`:
+В Kafka-конфиге `selector` — объект с любым числом пар «имя label: точное
+значение». Например:
 
 ```json
-{
-  "selector": {"job": "kafka-exporter"},
-  "label_name": "namespace",
-  "label_value": "kafka"
+"selector": {
+  "job": "kafka-exporter",
+  "namespace": "kafka"
 }
 ```
 
-Эти поля добавляют условие `namespace="kafka"` к `selector` в каждом запросе,
-включая `up`. Выберите label, который реально присутствует **и у Kafka-метрик,
-и у `up`**. `namespace` здесь лишь пример: проверьте labels своего target в
-Prometheus. Один только `namespace` может содержать несколько exporter;
-комбинация с `job` или другим стабильным label должна выбирать один target.
+При запросе `up` это даёт `up{job="kafka-exporter",namespace="kafka"}`. Поле
+`job` необязательно: можно указать `service`, `cluster` или другой label,
+который реально есть у ваших серий. Имя label должно быть допустимым именем
+Prometheus, значение — строкой. Условия объединяются через логическое И;
+регулярные выражения здесь не поддерживаются.
 
-`selector` по-прежнему принимает другие точные условия. Например, можно оставить
-в нём `job` и добавить `cluster`, если оба labels присутствуют у нужных серий.
-`label_name` и `label_value` задаются вместе, должны быть непустыми; повторять
-`label_name` в `selector` нельзя. `instance` в старом `selector` технически
-продолжает работать, но после изменения IP пода его придётся обновлять.
+`instance` в Kubernetes часто содержит IP пода и меняется после его перезапуска.
+Используйте устойчивые labels, которые присутствуют **и у Kafka-метрик, и у `up`**.
+`namespace` в примере — возможный вариант, но его наличие нужно проверить в
+вашем Prometheus. Несколько exporter могут иметь один `namespace`; комбинация
+условий должна выбирать один exporter одного Kafka-кластера.
 
-Пустой итоговый фильтр запрещён для Kafka-команд, кроме `prometheus.health`.
-Для Kubernetes фильтр не поддерживается: его запросы сохраняют существующую
-область выбора. Если K8s-источник содержит несколько кластеров, агрегаты могут
-объединять их, как и в исходном скрипте. Глобальные `PROM_LABEL_NAME` и
-`PROM_LABEL_VALUE` для K8s-конфига задавать не следует.
+Для Kafka пустой `selector` разрешён только для `prometheus.health`, который
+проверяет API Prometheus без Kafka-фильтра. Остальные Kafka-команды требуют
+непустой `selector`. Для Kubernetes фильтр необязателен; если он пуст и в
+Prometheus есть несколько кластеров, агрегаты могут объединять их.
 
 Скрипт Kafka отвергает повторяющиеся серии с одинаковыми предметными labels.
 Например, две серии lag с одинаковыми `consumergroup`, `topic`, `partition`
@@ -229,9 +253,7 @@ selector нужно проверить по реальным labels.
 | `password_file` | `PROM_PASSWORD_FILE` | Не задан |
 | `password` | Нет | Не задан |
 | `ca_file` | `PROM_CA_FILE` | Системное хранилище CA |
-| `selector` | Нет | `{}`; дополнительные точные условия Kafka |
-| `label_name` | `PROM_LABEL_NAME` | Пустая строка; имя стабильного label Kafka |
-| `label_value` | `PROM_LABEL_VALUE` | Пустая строка; значение этого label |
+| `selector` | Нет | `{}`; для Kubernetes необязателен, для Kafka обязателен при сборе метрик |
 | Выбор файла | `PROM_CONFIG` | Не задан |
 
 `PROM_PASSWORD` не используется. Неизвестные поля JSON приводят к ошибке, чтобы
@@ -251,7 +273,7 @@ PROM_URL=http://prometheus-k8s.example.org:9090 python3 k8s_prometheus.py cluste
 
 ## Версия
 
-Оба скрипта используют `__version__ = "1.2.0"` из `prometheus_common.py`.
+Оба скрипта используют `__version__ = "1.3.1"` из `prometheus_common.py`.
 Отдельного файла версии нет. После установки проверьте:
 
 ```bash
@@ -259,7 +281,7 @@ python3 kafka_prometheus.py --version
 python3 k8s_prometheus.py --version
 ```
 
-Обе команды должны вывести `1.2.0` и завершиться с кодом `0`. Они не обращаются
+Обе команды должны вывести `1.3.1` и завершиться с кодом `0`. Они не обращаются
 к Prometheus и не требуют файла конфигурации. Порядок выпусков и изменения API перечислены в
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -636,8 +658,8 @@ up{job="kafka-exporter",namespace="kafka"}
 
 Теперь сообщение об отсутствии серии содержит этот запрос и подсказку проверить
 labels у `up`. Если ответ HTTP содержит `"result": []`, Prometheus выполнил запрос,
-но подходящих серий нет. Сравните `job`, `label_name`/`label_value` и другие
-условия selector с labels реально существующей серии `up` в Prometheus. Labels самих Kafka-метрик
+но подходящих серий нет. Сравните все условия `selector` с labels реально
+существующей серии `up` в Prometheus. Labels самих Kafka-метрик
 и labels `up` могут отличаться; особенно это касается labels внутри exporter.
 
 Если видите `cache_hit` с пустым результатом, повторите запуск с `PROM_CACHE_TTL=0`,

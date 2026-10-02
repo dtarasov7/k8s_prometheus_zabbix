@@ -6,8 +6,7 @@
   "username": "zabbix",
   "password_file": "kafka.password",
   "selector": {
-    "job": "kafka-exporter"
-  },
-  "label_name": "namespace",
-  "label_value": "kafka"
+    "job": "kafka-exporter",
+    "namespace": "kafka"
+  }
 }

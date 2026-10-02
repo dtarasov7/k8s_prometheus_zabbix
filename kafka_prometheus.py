@@ -38,18 +38,23 @@ class KafkaMetrics:
             labels (tuple[str]): ключевые labels / key labels
 
         Returns / Возвращает:
-        dict[tuple, str]: значения по ключам / values by keys
+            dict[tuple, str]: значения по ключам / values by keys
 
         Raises / Исключения:
             MonitoringError: отсутствуют labels или есть дубли / missing labels or duplicates
         """
-        result = self.client.query(self.client.metric_query(metric))
+        query = self.client.metric_query(metric)
+        result = self.client.query(query)
         rows = {}
         for item in result:
             metadata = item["metric"]
-            if any(not metadata.get(label) for label in labels):
-                raise MonitoringError("В метрике Kafka отсутствуют обязательные labels")
-            key = tuple(metadata[label] for label in labels)
+            key_parts = []
+            for label in labels:
+                label_value = metadata.get(label)
+                if not label_value:
+                    raise MonitoringError("В метрике Kafka отсутствуют обязательные labels")
+                key_parts.append(label_value)
+            key = tuple(key_parts)
             # Дубли искажают агрегаты. / Duplicates would distort aggregation.
             if key in rows:
                 raise MonitoringError("Дубли серий Kafka: selector должен выбирать один exporter одного кластера")
@@ -108,16 +113,31 @@ class KafkaMetrics:
             MonitoringError: неверные или повторные серии / malformed or duplicate series
         """
         if kind == "topic":
-            labels, macros, metric = ("topic",), ("{#TOPIC}",), "kafka_topic_partitions"
+            metric = "kafka_topic_partitions"
+            labels = ("topic",)
+            macros = ("{#TOPIC}",)
         elif kind == "group":
-            labels, macros, metric = ("consumergroup",), ("{#CONSUMERGROUP}",), "kafka_consumergroup_members"
+            metric = "kafka_consumergroup_members"
+            labels = ("consumergroup",)
+            macros = ("{#CONSUMERGROUP}",)
         else:
+            metric = "kafka_consumergroup_lag"
             labels = ("consumergroup", "topic", "partition")
-            macros, metric = ("{#CONSUMERGROUP}", "{#TOPIC}"), "kafka_consumergroup_lag"
+            macros = ("{#CONSUMERGROUP}", "{#TOPIC}")
+
         rows = self.rows(metric, labels)
-        keys = sorted({key[:len(macros)] for key in rows})
+        unique_keys = set()
+        for key in rows:
+            unique_keys.add(key[:len(macros)])
+
+        items = []
+        for key in sorted(unique_keys):
+            item = {}
+            for macro, value in zip(macros, key):
+                item[macro] = value
+            items.append(item)
         # Пустой успешный ответ даёт пустой LLD. / Empty successful data yields empty LLD.
-        return {"data": [dict(zip(macros, key)) for key in keys]}
+        return {"data": items}
 
     def brokers(self):
         """Возвращает количество брокеров. / Returns broker count.
@@ -129,7 +149,8 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("kafka_brokers", ())
-        return self.nonnegative(self.require(rows, (), "kafka_brokers"))
+        raw_value = self.require(rows, (), "kafka_brokers")
+        return self.nonnegative(raw_value)
 
     def exporter_up(self):
         """Читает доступность выбранного exporter. / Reads availability of the selected exporter.
@@ -141,7 +162,8 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("up", ())
-        value = self.nonnegative(self.require(rows, (), "up"))
+        raw_value = self.require(rows, (), "up")
+        value = self.nonnegative(raw_value)
         if value not in (0, 1):
             raise MonitoringError("Метрика up должна быть 0 или 1")
         return value
@@ -159,7 +181,8 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("kafka_consumergroup_members", ("consumergroup",))
-        return self.nonnegative(self.require(rows, (group,), "kafka_consumergroup_members"))
+        raw_value = self.require(rows, (group,), "kafka_consumergroup_members")
+        return self.nonnegative(raw_value)
 
     def topic_partitions(self, topic):
         """Возвращает число партиций топика. / Returns topic partition count.
@@ -174,7 +197,8 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("kafka_topic_partitions", ("topic",))
-        return self.nonnegative(self.require(rows, (topic,), "kafka_topic_partitions"))
+        raw_value = self.require(rows, (topic,), "kafka_topic_partitions")
+        return self.nonnegative(raw_value)
 
     def under_replicated(self, topic):
         """Считает недореплицированные партиции топика. / Counts under-replicated topic partitions.
@@ -189,11 +213,16 @@ class KafkaMetrics:
             MonitoringError: данных нет или индикатор неверен / missing data or invalid flag
         """
         rows = self.rows("kafka_topic_partition_under_replicated_partition", ("topic", "partition"))
-        values = [self.nonnegative(value) for key, value in rows.items() if key[0] == topic]
+        values = []
+        for key, raw_value in rows.items():
+            if key[0] != topic:
+                continue
+            value = self.nonnegative(raw_value)
+            if value not in (0, 1):
+                raise MonitoringError("Индикатор недорепликации должен быть 0 или 1")
+            values.append(value)
         if not values:
             raise MonitoringError("Нет данных о репликации топика")
-        if any(value not in (0, 1) for value in values):
-            raise MonitoringError("Индикатор недорепликации должен быть 0 или 1")
         return sum(values)
 
     def lag(self, group, topic, operation):
@@ -211,10 +240,17 @@ class KafkaMetrics:
             MonitoringError: нет серий или значение неверно / missing series or invalid value
         """
         rows = self.rows("kafka_consumergroup_lag", ("consumergroup", "topic", "partition"))
-        values = [self.nonnegative(value) for key, value in rows.items() if key[:2] == (group, topic)]
+        values = []
+        for key, raw_value in rows.items():
+            if key[:2] != (group, topic):
+                continue
+            value = self.nonnegative(raw_value)
+            values.append(value)
         if not values:
             raise MonitoringError("Нет данных lag для группы и топика")
-        return sum(values) if operation == "sum" else max(values)
+        if operation == "sum":
+            return sum(values)
+        return max(values)
 
 
 def parser():
@@ -233,9 +269,11 @@ def parser():
     for name in ("prometheus.health", "exporter.up", "brokers", "topic.discovery",
                  "group.discovery", "group_topic.discovery"):
         commands.add_parser(name)
-    commands.add_parser("group.members").add_argument("group")
+    group_members = commands.add_parser("group.members")
+    group_members.add_argument("group")
     for name in ("topic.partitions", "topic.under_replicated"):
-        commands.add_parser(name).add_argument("topic")
+        topic_command = commands.add_parser(name)
+        topic_command.add_argument("topic")
     for name in ("group_topic.lag.sum", "group_topic.lag.max"):
         command = commands.add_parser(name)
         command.add_argument("group")
@@ -256,15 +294,21 @@ def main(argv=None):
         None: ошибки сбора пишутся в stderr / collection errors are printed to stderr
     """
     try:
-        config_path, debug_path, args = extract_config(sys.argv[1:] if argv is None else argv)
-        args = parser().parse_args(args)
-        client = PrometheusClient("kafka", config_path, debug=DebugLog(debug_path))
+        cli_args = sys.argv[1:] if argv is None else argv
+        config_path, debug_path, command_args = extract_config(cli_args)
+        command_parser = parser()
+        args = command_parser.parse_args(command_args)
+        debug_log = DebugLog(debug_path)
+        client = PrometheusClient("kafka", config_path, debug=debug_log)
         if args.command == "prometheus.health":
-            print_value(client.health())
+            health_value = client.health()
+            print_value(health_value)
             return 0
         kafka = KafkaMetrics(client)
         if args.command.endswith(".discovery"):
-            print(json.dumps(kafka.discovery(args.command.split(".")[0]), ensure_ascii=False))
+            discovery_kind = args.command.split(".")[0]
+            discovery = kafka.discovery(discovery_kind)
+            print(json.dumps(discovery, ensure_ascii=False))
             return 0
         if args.command == "exporter.up":
             value = kafka.exporter_up()
@@ -277,7 +321,8 @@ def main(argv=None):
         elif args.command == "topic.under_replicated":
             value = kafka.under_replicated(args.topic)
         else:
-            value = kafka.lag(args.group, args.topic, args.command.rsplit(".", 1)[1])
+            operation = args.command.rsplit(".", 1)[1]
+            value = kafka.lag(args.group, args.topic, operation)
         print_value(value)
         return 0
     except MonitoringError as exc:
