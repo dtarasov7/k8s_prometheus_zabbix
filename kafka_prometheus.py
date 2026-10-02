@@ -7,7 +7,7 @@ import json
 import sys
 
 from prometheus_common import (
-    MonitoringError, PrometheusClient, __version__, extract_config, number, print_value,
+    DebugLog, MonitoringError, PrometheusClient, __version__, extract_config, number, print_value,
 )
 
 
@@ -74,13 +74,13 @@ class KafkaMetrics:
             raise MonitoringError("Ожидалось неотрицательное целое значение Kafka; проверьте offsets")
         return value
 
-    @staticmethod
-    def require(rows, key):
+    def require(self, rows, key, metric):
         """Требует наличия выбранной серии. / Requires a selected series to exist.
 
         Args / Аргументы:
             rows (dict): серии по ключам / indexed series
             key (tuple): нужный ключ / requested key
+            metric (str): имя метрики для диагностики / metric name for diagnostics
 
         Returns / Возвращает:
             str: значение серии / sample value
@@ -89,7 +89,10 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует / missing series
         """
         if key not in rows:
-            raise MonitoringError("Запрошенная серия Kafka отсутствует; это не нулевое значение")
+            query = self.client.metric_query(metric)
+            self.client.debug.write("missing_series", query=query, key=list(key))
+            hint = " Проверьте selector: его labels должны присутствовать у up." if metric == "up" else ""
+            raise MonitoringError(f"Серия отсутствует: запрос {query}, ключ {key}.{hint}")
         return rows[key]
 
     def discovery(self, kind):
@@ -126,7 +129,7 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("kafka_brokers", ())
-        return self.nonnegative(self.require(rows, ()))
+        return self.nonnegative(self.require(rows, (), "kafka_brokers"))
 
     def exporter_up(self):
         """Читает доступность выбранного exporter. / Reads availability of the selected exporter.
@@ -138,7 +141,7 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("up", ())
-        value = self.nonnegative(self.require(rows, ()))
+        value = self.nonnegative(self.require(rows, (), "up"))
         if value not in (0, 1):
             raise MonitoringError("Метрика up должна быть 0 или 1")
         return value
@@ -156,7 +159,7 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("kafka_consumergroup_members", ("consumergroup",))
-        return self.nonnegative(self.require(rows, (group,)))
+        return self.nonnegative(self.require(rows, (group,), "kafka_consumergroup_members"))
 
     def topic_partitions(self, topic):
         """Возвращает число партиций топика. / Returns topic partition count.
@@ -171,7 +174,7 @@ class KafkaMetrics:
             MonitoringError: серия отсутствует или неверна / missing or invalid series
         """
         rows = self.rows("kafka_topic_partitions", ("topic",))
-        return self.nonnegative(self.require(rows, (topic,)))
+        return self.nonnegative(self.require(rows, (topic,), "kafka_topic_partitions"))
 
     def under_replicated(self, topic):
         """Считает недореплицированные партиции топика. / Counts under-replicated topic partitions.
@@ -222,7 +225,7 @@ def parser():
 
     """
     result = argparse.ArgumentParser(
-        description="Kafka exporter → Prometheus → Zabbix. --config PATH указывается перед командой.",
+        description="Kafka exporter → Prometheus → Zabbix. --config PATH и --debug-log PATH указываются перед командой.",
         epilog="Настройки и примеры UserParameter описаны в README.md.",
     )
     result.add_argument("--version", action="version", version=__version__)
@@ -253,9 +256,9 @@ def main(argv=None):
         None: ошибки сбора пишутся в stderr / collection errors are printed to stderr
     """
     try:
-        config_path, args = extract_config(sys.argv[1:] if argv is None else argv)
+        config_path, debug_path, args = extract_config(sys.argv[1:] if argv is None else argv)
         args = parser().parse_args(args)
-        client = PrometheusClient("kafka", config_path)
+        client = PrometheusClient("kafka", config_path, debug=DebugLog(debug_path))
         if args.command == "prometheus.health":
             print_value(client.health())
             return 0

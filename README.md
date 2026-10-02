@@ -1,8 +1,9 @@
 # Метрики Kubernetes и Kafka из Prometheus для Zabbix
 
 Текущая версия: **1.1.0**. Предыдущая версия Kubernetes-скрипта считается
-**v1.0.0**. Изменения описаны в [changelog.md](changelog.md).
-Версия хранится в `VERSION` и выводится командой `--version` обоих скриптов.
+**v1.0.0**. Изменения описаны в [CHANGELOG.md](CHANGELOG.md).
+Версия хранится в переменной `__version__` модуля `prometheus_common.py` и выводится
+командой `--version` обоих скриптов.
 
 Скрипты получают данные через Prometheus HTTP API и возвращают числа либо JSON
 для Low-level discovery (LLD). Подключаться непосредственно к Kubernetes API или
@@ -19,8 +20,7 @@ Kubernetes и Kafka могут находиться в одном Prometheus и�
 | `k8s_prometheus.py` | Существующие проверки Kubernetes: ноды, состояния контейнеров, PVC, ingress |
 | `kafka_prometheus.py` | Проверки Kafka: lag, группы, топики, репликация и брокеры |
 | `prometheus_common.py` | HTTP-клиент, авторизация, TLS, конфигурация и файловый кэш |
-| `VERSION` | Единый номер версии обоих скриптов |
-| `changelog.md` | История версий и несовместимых изменений |
+| `CHANGELOG.md` | История версий и несовместимых изменений |
 | `examples/k8s.json` | Пример подключения без авторизации |
 | `examples/kafka.json` | Пример отдельного Prometheus с Basic Auth |
 | `examples/zabbix_agentd_prometheus.conf` | Все UserParameter для обоих скриптов |
@@ -61,7 +61,7 @@ Zabbix server/proxy → Zabbix agent → k8s_prometheus.py   → Prometheus Kube
 ```bash
 sudo install -d -o root -g root -m 0755 /etc/zabbix/scripts
 sudo install -o root -g root -m 0755 k8s_prometheus.py kafka_prometheus.py /etc/zabbix/scripts/
-sudo install -o root -g root -m 0644 prometheus_common.py VERSION /etc/zabbix/scripts/
+sudo install -o root -g root -m 0644 prometheus_common.py /etc/zabbix/scripts/
 
 sudo install -d -o root -g zabbix -m 0750 /etc/zabbix/prometheus
 sudo install -o root -g zabbix -m 0640 examples/k8s.json /etc/zabbix/prometheus/k8s.json
@@ -71,7 +71,7 @@ sudo install -d -o zabbix -g zabbix -m 0700 /var/cache/k8s-prometheus
 sudo install -d -o zabbix -g zabbix -m 0700 /var/cache/kafka-prometheus
 ```
 
-Все три Python-файла и `VERSION` должны находиться рядом. Измените адреса и selector в
+Все три Python-файла должны находиться рядом. Измените адреса и selector в
 установленных JSON-файлах перед запуском. Примеры не содержат настоящих паролей.
 
 ## Настройка подключения
@@ -238,7 +238,8 @@ PROM_URL=http://prometheus-k8s.example.org:9090 python3 k8s_prometheus.py cluste
 
 ## Версия
 
-Оба скрипта читают номер из соседнего файла `VERSION`. После установки проверьте:
+Оба скрипта используют `__version__ = "1.1.0"` из `prometheus_common.py`.
+Отдельного файла версии нет. После установки проверьте:
 
 ```bash
 python3 kafka_prometheus.py --version
@@ -246,9 +247,8 @@ python3 k8s_prometheus.py --version
 ```
 
 Обе команды должны вывести `1.1.0` и завершиться с кодом `0`. Они не обращаются
-к Prometheus и не требуют файла конфигурации. При обновлении копируйте `VERSION`
-вместе с Python-файлами. Порядок выпусков и изменения API перечислены в
-[changelog.md](changelog.md).
+к Prometheus и не требуют файла конфигурации. Порядок выпусков и изменения API перечислены в
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Команды Kafka
 
@@ -530,7 +530,9 @@ Zabbix может объединять stdout и stderr команды. Поэт
 значение может остаться `1`, поэтому для этой проверки нужен `nodata`, а не
 условие `last(...)=0`.
 
-В сообщениях клиента не выводятся пароль, Authorization или тело ответа API.
+В обычных сообщениях клиента не выводятся пароль, Authorization или тело ответа API.
+При включённом `--debug-log` тело ответа записывается в файл с маскированием
+известных клиенту пароля и Basic Auth token.
 HTTP-код сохраняется для диагностики. Отсутствие метрик и ошибку авторизации
 следует проверять отдельно.
 
@@ -554,6 +556,84 @@ HTTP-код сохраняется для диагностики. Отсутст
 Итоговая задержка обнаружения зависит от scrape interval Prometheus, TTL и
 интервала опроса Zabbix. Для более быстрой реакции уменьшите их согласованно.
 Для production задайте `/var/cache/...`: каталог `/tmp` может очищаться системой.
+
+## Отладочный журнал
+
+Оба скрипта поддерживают `--debug-log PATH`. Ключ задаётся перед командой;
+порядок относительно `--config` произвольный. Без этого ключа журнал не создаётся.
+
+Пример для `exporter.up`, с отключением кэша на один запуск:
+
+```bash
+sudo -u zabbix env PROM_CACHE_TTL=0 /usr/bin/python3 /etc/zabbix/scripts/kafka_prometheus.py \
+  --config /etc/zabbix/prometheus/kafka.json \
+  --debug-log /var/cache/kafka-prometheus/debug.jsonl exporter.up
+```
+
+Пример для Kubernetes:
+
+```bash
+sudo -u zabbix /usr/bin/python3 /etc/zabbix/scripts/k8s_prometheus.py \
+  --debug-log /var/cache/k8s-prometheus/debug.jsonl \
+  --config /etc/zabbix/prometheus/k8s.json cluster pending
+```
+
+Родительский каталог журнала должен существовать и быть доступен пользователю
+агента. Новый файл создаётся с правами `0600`, существующий дополняется.
+Если запись невозможна, команда завершится с понятной ошибкой.
+
+Формат — JSON Lines: одна JSON-запись на строку. Каждая запись содержит UTC-время,
+PID и тип события `event`. Содержимое журнала:
+
+| Событие | Что записывается |
+|---|---|
+| `start`, `client` | Версия, URL источника, selector, timeout и TTL |
+| `query` | Полный URL с параметрами и исходный PromQL |
+| `cache_hit` | Возвращённый результат из кэша; HTTP-запрос не выполнялся |
+| `cache_miss`, `cache_disabled` | Причина перехода к HTTP-запросу |
+| `http_request` | Метод, полный URL, PromQL, тело запроса и признак Basic Auth |
+| `http_response` | HTTP-код и тело ответа, включая ответы с ошибкой HTTP |
+| `http_error`, `request_error` | Тип/описание ошибки сети, TLS, JSON или redirect |
+| `missing_series` | Запрос и ключ серии, которую не удалось найти |
+
+Запросы используют **GET**: PromQL передаётся в параметре `query` URL, тела
+запроса нет (`"body": null`). В `http_response.body` содержится строка исходного
+ответа сервера, в том числе HTML вместо JSON. Заголовок Authorization не пишется;
+известные клиенту пароль и Basic Auth token заменяются на `[REDACTED]`, если
+встретились в ответе. Остальные данные ответа, включая labels, записываются.
+
+Чтобы просмотреть JSON Lines в более удобном виде:
+
+```bash
+sudo -u zabbix python3 - <<'PYCODE'
+import json
+with open("/var/cache/kafka-prometheus/debug.jsonl", encoding="utf-8") as stream:
+    for line in stream:
+        print(json.dumps(json.loads(line), ensure_ascii=False, indent=2))
+PYCODE
+```
+
+### Как разбирать отсутствие `exporter.up`
+
+Команда запрашивает встроенную метрику Prometheus `up` с selector из Kafka-конфига:
+
+```promql
+up{instance="kafka-exporter.example.org:9308",job="kafka-exporter"}
+```
+
+Теперь сообщение об отсутствии серии содержит этот запрос и подсказку проверить
+labels у `up`. Если ответ HTTP содержит `"result": []`, Prometheus выполнил запрос,
+но подходящих серий нет. Сравните `job`, `instance` и другие условия selector
+с labels реально существующей серии `up` в Prometheus. Labels самих Kafka-метрик
+и labels `up` могут отличаться; особенно это касается labels внутри exporter.
+
+Если видите `cache_hit` с пустым результатом, повторите запуск с `PROM_CACHE_TTL=0`,
+как в примере выше. Debug-ключ сам по себе не отключает кэш.
+
+Журнал не попадает в stdout и не меняет числовой формат ответа Zabbix. Для временной
+диагностики через агент можно добавить `--debug-log PATH` перед командой в нужной
+строке UserParameter. После отладки уберите ключ: ответы могут быть большими,
+автоматической ротации журнала нет.
 
 ## Проверка после установки
 
@@ -600,12 +680,11 @@ items и триггеры в Zabbix: их нужно настроить по п�
 | Работает от root, не работает от zabbix | Права на JSON, пароль, CA, каталоги и кэш; окружение сервиса |
 | Таймаут агента | Таймаут выполнения item, задержки Prometheus, доступность сети |
 | `ModuleNotFoundError: prometheus_common` | Общий модуль должен лежать рядом со скриптами |
-| Ошибка чтения `VERSION` при запуске | Установите `VERSION` рядом с `prometheus_common.py` |
 
 ## Обновление существующей установки K8s
 
 1. Сохраните используемую конфигурацию и старый скрипт штатными средствами резервного копирования.
-2. Установите `prometheus_common.py` и `VERSION` рядом с обновлённым `k8s_prometheus.py`.
+2. Установите `prometheus_common.py` рядом с обновлённым `k8s_prometheus.py`.
 3. Существующие команды и переменные `PROM_URL`, `PROM_TIMEOUT`, `PROM_CACHE_TTL`,
    `PROM_CACHE_DIR` можно оставить. При переходе на JSON уберите конфликтующие
    глобальные переменные окружения сервиса.

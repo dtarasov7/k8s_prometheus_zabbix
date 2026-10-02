@@ -19,7 +19,7 @@ import unittest
 from unittest.mock import patch
 import urllib.parse
 
-from prometheus_common import MonitoringError, PrometheusClient, load_settings
+from prometheus_common import MonitoringError, PrometheusClient, __version__, load_settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,8 +118,8 @@ class IntegrationTests(unittest.TestCase):
         if text:
             self.assertIn(text, result.stderr)
 
-    def test_version_matches_release_file_without_prometheus(self):
-        expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    def test_version_matches_code_without_prometheus(self):
+        expected = __version__
         self.assertEqual(expected, "1.1.0")
         self.server.status = 503
         for script in ("kafka_prometheus.py", "k8s_prometheus.py"):
@@ -127,6 +127,72 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual((result.returncode, result.stdout, result.stderr),
                              (0, expected + "\n", ""))
         self.assertEqual(self.server.calls, [])
+
+    def test_debug_empty_up_records_request_response_and_selector(self):
+        log = self.directory / "debug.jsonl"
+        self.respond("up", [])
+        query = self.client().metric_query("up")
+        result = self.cli("--debug-log", str(log), "exporter.up")
+        self.assert_failure(result, query)
+        self.assertIn("selector", result.stderr)
+        records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        request = next(row for row in records if row["event"] == "http_request")
+        self.assertEqual(request["method"], "GET")
+        self.assertIsNone(request["body"])
+        self.assertEqual(request["query"], query)
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(request["url"]).query), {"query": [query]})
+        response = next(row for row in records if row["event"] == "http_response")
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(json.loads(response["body"]), vector([]))
+        self.assertEqual(records[-1]["event"], "missing_series")
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        # Второй процесс использует кэш и дописывает файл. / Next process appends a cache hit.
+        result = self.cli("--debug-log", str(log), "exporter.up")
+        self.assert_failure(result, query)
+        records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(sum(row["event"] == "http_request" for row in records), 1)
+        self.assertEqual(next(row for row in records if row["event"] == "cache_hit")["result"], [])
+
+    def test_debug_k8s_does_not_change_numeric_output(self):
+        config = self.write_config(selector={})
+        log = self.directory / "k8s-debug.jsonl"
+        result = self.cli("--debug-log", str(log), "cluster", "pending", script="k8s_prometheus.py", config=config)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "1\n", ""))
+        records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(row["event"] == "http_response" for row in records))
+
+    def test_debug_http_error_masks_credentials_in_response(self):
+        log = self.directory / "auth-debug.jsonl"
+        password = 'private"пароль'
+        token = base64.b64encode(("reader:" + password).encode()).decode()
+        config = self.write_config(username="reader", password=password)
+        self.server.status = 403
+        self.server.default = {"error": password, "echo": "Basic " + token}
+        result = self.cli("--debug-log", str(log), "brokers", config=config)
+        self.assert_failure(result, "403")
+        content = log.read_text(encoding="utf-8")
+        self.assertNotIn(password, content)
+        self.assertNotIn(token, content)
+        records = [json.loads(line) for line in content.splitlines()]
+        response = next(row for row in records if row["event"] == "http_response")
+        self.assertEqual(response["status"], 403)
+        self.assertEqual(json.loads(response["body"]), {"error": "[REDACTED]", "echo": "Basic [REDACTED]"})
+
+    def test_debug_invalid_json_records_raw_response(self):
+        log = self.directory / "bad-json.jsonl"
+        self.server.default = b"<html>proxy error</html>"
+        self.assert_failure(self.cli("--debug-log", str(log), "brokers"))
+        records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(next(row for row in records if row["event"] == "http_response")["body"], "<html>proxy error</html>")
+        self.assertEqual(records[-1]["event"], "http_error")
+
+    def test_debug_unwritable_path_fails_before_request(self):
+        log = self.directory / "missing-parent" / "debug.jsonl"
+        self.assert_failure(self.cli("--debug-log", str(log), "brokers"), "debug")
+        self.assertEqual(self.server.calls, [])
+
+    def test_debug_option_requires_path(self):
+        self.assert_failure(self.cli("--debug-log"), "--debug-log")
 
     def test_basic_auth_from_password_file(self):
         secret = 'secret:пароль $"'

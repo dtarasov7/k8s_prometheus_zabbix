@@ -42,7 +42,7 @@ import json
 import sys
 
 from prometheus_common import (
-    MonitoringError, PrometheusClient, __version__, extract_config, number, print_value,
+    DebugLog, MonitoringError, PrometheusClient, __version__, extract_config, number, print_value,
 )
 
 
@@ -276,7 +276,7 @@ def usage():
     print("""
 Usage:
 
-  k8s_prometheus.py [--config PATH] <command> [args]
+  k8s_prometheus.py [--config PATH] [--debug-log PATH] <command> [args]
   k8s_prometheus.py --version
   k8s_prometheus.py prometheus.health
   k8s_prometheus.py node.discovery
@@ -327,7 +327,7 @@ def main():
     """
     global _client
     try:
-        config_path, args = extract_config(sys.argv[1:])
+        config_path, debug_path, args = extract_config(sys.argv[1:])
         sys.argv = [sys.argv[0]] + args
         if args in (["--help"], ["-h"]):
             usage()
@@ -339,7 +339,7 @@ def main():
             usage()
             sys.exit(1)
 
-        _client = PrometheusClient("k8s", config_path)
+        _client = PrometheusClient("k8s", config_path, debug=DebugLog(debug_path))
         if _client.selector:
             raise MonitoringError("selector поддерживается только kafka_prometheus.py")
         command = sys.argv[1]

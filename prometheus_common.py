@@ -20,7 +20,7 @@ import urllib.request
 
 
 # Single release source / Единый источник версии выпуска.
-__version__ = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
+__version__ = "1.1.0"
 
 
 class MonitoringError(Exception):
@@ -91,25 +91,85 @@ def print_value(value):
     print(int(value) if value.is_integer() else value)
 
 
+class DebugLog:
+    """Пишет диагностику в JSON Lines. / Writes diagnostics as JSON Lines."""
+
+    def __init__(self, path=None):
+        """Задаёт файл журнала. / Sets the optional log file.
+
+        Args / Аргументы:
+            path (str | None): путь файла / file path; None отключает журнал / disables logging.
+        Returns / Возвращает:
+            None: журнал настроен / log configured.
+        Raises / Исключения:
+            MonitoringError: файл недоступен / file is not writable.
+        """
+        self.path = path
+        self.secrets = []
+        if path:
+            self.write("start", version=__version__)
+
+    def write(self, event, **fields):
+        """Дописывает событие, скрывая известные секреты. / Appends an event with known secrets masked.
+
+        Args / Аргументы:
+            event (str): тип события / event type.
+            fields (dict): диагностические поля / diagnostic fields.
+        Returns / Возвращает:
+            None: запись в файл, если включено / file output when enabled.
+        Raises / Исключения:
+            MonitoringError: файл недоступен / file is not writable.
+        """
+        if not self.path:
+            return
+        record = {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "pid": os.getpid(), "event": event, **fields}
+        # Маскируем до сериализации, включая строковые тела ответов. / Mask before serialization, including response bodies.
+        def redact(value):
+            """Маскирует секреты в значениях. / Masks secrets in values.
+
+            Args / Аргументы:
+                value (object): JSON-совместимое значение / JSON-compatible value.
+            Returns / Возвращает:
+                object: значение со скрытыми секретами / value with secrets masked.
+            """
+            if isinstance(value, str):
+                for secret in sorted(self.secrets, key=len, reverse=True):
+                    if secret:
+                        value = value.replace(secret, "[REDACTED]")
+                return value
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+        line = json.dumps(redact(record), ensure_ascii=False) + "\n"
+        try:
+            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+                stream.write(line)
+        except OSError as exc:
+            raise MonitoringError("Не удалось записать debug-журнал; проверьте путь и права") from exc
+
+
 def extract_config(argv):
-    """Отделяет путь к конфигу от аргументов команды. / Extracts configuration path from CLI arguments.
+    """Разбирает общие CLI-ключи перед командой. / Parses shared options before the command.
 
     Args / Аргументы:
-        argv (list[str]): аргументы без имени скрипта / arguments excluding script name
-
+        argv (list[str]): аргументы без имени скрипта / arguments excluding script name.
     Returns / Возвращает:
-        tuple[str | None, list[str]]: путь и остальные аргументы / path and remaining arguments
-
+        tuple: путь конфига, путь журнала, оставшиеся аргументы / config path, log path, remaining arguments.
     Raises / Исключения:
-        MonitoringError: после --config нет пути / missing path after --config
+        MonitoringError: отсутствует значение ключа / missing option value.
     """
     args = list(argv)
-    path = os.environ.get("PROM_CONFIG")
-    if args and args[0] == "--config":
-        if len(args) < 2:
-            raise MonitoringError("После --config нужен путь к JSON-файлу")
-        path, args = args[1], args[2:]
-    return path, args
+    options = {"--config": os.environ.get("PROM_CONFIG"), "--debug-log": None}
+    while args and args[0] in options:
+        option = args.pop(0)
+        if not args or args[0].startswith("--"):
+            raise MonitoringError(f"После {option} нужен путь к файлу")
+        options[option] = args.pop(0)
+    return options["--config"], options["--debug-log"], args
 
 
 def load_settings(service, path=None):
@@ -192,12 +252,13 @@ def load_settings(service, path=None):
 class PrometheusClient:
     """Клиент instant query с Basic Auth, TLS и кэшем. / Instant-query client with Basic Auth, TLS, and cache.
     """
-    def __init__(self, service, config_path=None):
+    def __init__(self, service, config_path=None, debug=None):
         """Создаёт клиент для выбранной интеграции. / Initializes a client for an integration.
 
         Args / Аргументы:
             service (str): имя интеграции / integration name
             config_path (str | None): путь JSON / JSON path
+            debug (DebugLog | None): журнал запросов / request log
 
         Returns / Возвращает:
             None: заполненный клиент / initialized client
@@ -207,6 +268,15 @@ class PrometheusClient:
         """
         self.settings = load_settings(service, config_path)
         self.selector = self.settings["selector"]
+        self.debug = debug or DebugLog()
+        password = self.settings["password"]
+        if password:
+            credentials = (self.settings["username"] + ":" + password).encode("utf-8")
+            self.debug.secrets = [password, json.dumps(password, ensure_ascii=False)[1:-1],
+                                  json.dumps(password, ensure_ascii=True)[1:-1],
+                                  base64.b64encode(credentials).decode("ascii")]
+        self.debug.write("client", url=self.settings["url"], selector=self.selector,
+                         timeout=self.settings["timeout"], cache_ttl=self.settings["cache_ttl"])
         try:
             context = ssl.create_default_context(cafile=self.settings["ca_file"] or None)
         except (OSError, ssl.SSLError) as exc:
@@ -344,24 +414,43 @@ class PrometheusClient:
             MonitoringError: HTTP, TLS, JSON, warning или неверный ответ / HTTP, TLS, JSON, warning, or invalid response
         """
         query = query.strip()
+        url = self.settings["url"] + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
+        self.debug.write("query", url=url, query=query)
         cache_enabled = use_cache and self.settings["cache_ttl"] > 0
         if cache_enabled:
             cached = self.read_cache(query)
             if cached is not None:
+                self.debug.write("cache_hit", query=query, result=cached)
                 return cached
-        url = self.settings["url"] + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
+        self.debug.write("cache_miss" if cache_enabled else "cache_disabled", query=query)
         request = urllib.request.Request(url, headers={"Accept": "application/json"})
         if self.settings["username"]:
             credentials = (self.settings["username"] + ":" + self.settings["password"]).encode("utf-8")
             request.add_header("Authorization", "Basic " + base64.b64encode(credentials).decode("ascii"))
+        # GET передаёт PromQL в URL; тело отсутствует. / GET carries PromQL in the URL, without a body.
+        self.debug.write("http_request", method="GET", url=url, query=query, body=None,
+                         basic_auth=bool(self.settings["username"]))
         try:
             with self.opener.open(request, timeout=self.settings["timeout"]) as response:
-                data = json.load(response)
+                raw = response.read()
+                self.debug.write("http_response", url=url, status=response.status,
+                                 body=raw.decode("utf-8", errors="replace"))
+                data = json.loads(raw)
         except urllib.error.HTTPError as exc:
+            if self.debug.path:
+                try:
+                    raw_error = exc.read().decode("utf-8", errors="replace")
+                except (OSError, http.client.HTTPException) as read_error:
+                    raw_error = f"<response read failed: {type(read_error).__name__}>"
+                self.debug.write("http_response", url=url, status=exc.code, body=raw_error)
+            exc.close()
             raise MonitoringError(f"Prometheus вернул HTTP {exc.code}") from exc
         except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as exc:
-            # Не выводим URL, заголовки и тело ответа, где могут оказаться секреты.
+            self.debug.write("http_error", url=url, error_type=type(exc).__name__, message=str(exc))
             raise MonitoringError("Не удалось получить ответ Prometheus: сеть, TLS или JSON") from exc
+        except MonitoringError as exc:
+            self.debug.write("request_error", url=url, message=str(exc))
+            raise
         if not isinstance(data, dict) or data.get("status") != "success":
             raise MonitoringError("Prometheus сообщил об ошибке запроса")
         body = data.get("data")
