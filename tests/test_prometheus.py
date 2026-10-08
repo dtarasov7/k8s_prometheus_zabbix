@@ -120,7 +120,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_version_matches_code_without_prometheus(self):
         expected = __version__
-        self.assertEqual(expected, "1.3.1")
+        self.assertEqual(expected, "1.3.2")
         self.server.status = 503
         for script in ("kafka_prometheus.py", "k8s_prometheus.py"):
             result = self.cli("--version", script=script)

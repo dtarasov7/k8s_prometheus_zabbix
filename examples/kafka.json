@@ -7,6 +7,8 @@
   "password_file": "kafka.password",
   "selector": {
     "job": "kafka-exporter",
-    "namespace": "kafka"
+    "namespace": "kafka",
+    "service": "kafka-exporter",
+    "cluster": "production"
   }
 }

@@ -1,6 +1,6 @@
 # Метрики Kubernetes и Kafka из Prometheus для Zabbix
 
-Текущая версия: **1.3.1**. Предыдущие выпуски: **v1.3.0**, **v1.2.0**,
+Текущая версия: **1.3.2**. Предыдущие выпуски: **v1.3.1**, **v1.3.0**, **v1.2.0**,
 **v1.1.0** и **v1.0.0**. Изменения описаны в [CHANGELOG.md](CHANGELOG.md).
 Версия хранится в переменной `__version__` модуля `prometheus_common.py` и выводится
 командой `--version` обоих скриптов.
@@ -85,7 +85,10 @@ sudo install -d -o zabbix -g zabbix -m 0700 /var/cache/kafka-prometheus
   "url": "http://prometheus-k8s.example.org:9090",
   "timeout": 5,
   "cache_ttl": 60,
-  "cache_dir": "/var/cache/k8s-prometheus"
+  "cache_dir": "/var/cache/k8s-prometheus",
+  "selector": {
+    "cluster": "production"
+  }
 }
 ```
 
@@ -132,7 +135,9 @@ sum(kube_pod_status_phase{cluster="production",phase="Pending"})
   "password_file": "kafka.password",
   "selector": {
     "job": "kafka-exporter",
-    "namespace": "kafka"
+    "namespace": "kafka",
+    "service": "kafka-exporter",
+    "cluster": "production"
   }
 }
 ```
@@ -206,11 +211,14 @@ HTTP-перенаправления не выполняются, чтобы не
 ```json
 "selector": {
   "job": "kafka-exporter",
-  "namespace": "kafka"
+  "namespace": "kafka",
+  "service": "kafka-exporter",
+  "cluster": "production"
 }
 ```
 
-При запросе `up` это даёт `up{job="kafka-exporter",namespace="kafka"}`. Поле
+При запросе `up` это даёт
+`up{cluster="production",job="kafka-exporter",namespace="kafka",service="kafka-exporter"}`. Поле
 `job` необязательно: можно указать `service`, `cluster` или другой label,
 который реально есть у ваших серий. Имя label должно быть допустимым именем
 Prometheus, значение — строкой. Условия объединяются через логическое И;
@@ -218,8 +226,9 @@ Prometheus, значение — строкой. Условия объединя
 
 `instance` в Kubernetes часто содержит IP пода и меняется после его перезапуска.
 Используйте устойчивые labels, которые присутствуют **и у Kafka-метрик, и у `up`**.
-`namespace` в примере — возможный вариант, но его наличие нужно проверить в
-вашем Prometheus. Несколько exporter могут иметь один `namespace`; комбинация
+`namespace`, `service` и `cluster` в примере — возможные варианты, но их наличие
+и значения нужно проверить в вашем Prometheus. Несколько exporter могут иметь
+одинаковые значения этих labels; комбинация
 условий должна выбирать один exporter одного Kafka-кластера.
 
 Для Kafka пустой `selector` разрешён только для `prometheus.health`, который
@@ -273,7 +282,7 @@ PROM_URL=http://prometheus-k8s.example.org:9090 python3 k8s_prometheus.py cluste
 
 ## Версия
 
-Оба скрипта используют `__version__ = "1.3.1"` из `prometheus_common.py`.
+Оба скрипта используют `__version__ = "1.3.2"` из `prometheus_common.py`.
 Отдельного файла версии нет. После установки проверьте:
 
 ```bash
@@ -281,7 +290,7 @@ python3 kafka_prometheus.py --version
 python3 k8s_prometheus.py --version
 ```
 
-Обе команды должны вывести `1.3.1` и завершиться с кодом `0`. Они не обращаются
+Обе команды должны вывести `1.3.2` и завершиться с кодом `0`. Они не обращаются
 к Prometheus и не требуют файла конфигурации. Порядок выпусков и изменения API перечислены в
 [CHANGELOG.md](CHANGELOG.md).
 
